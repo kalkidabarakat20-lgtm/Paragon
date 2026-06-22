@@ -17,6 +17,17 @@
 <link rel="apple-touch-icon" href="apple-touch-icon.png" />
 <link rel="icon" type="image/png" sizes="192x192" href="icon-192.png" />
 <script>if("serviceWorker" in navigator){addEventListener("load",function(){navigator.serviceWorker.register("sw.js").catch(function(){});});}</script>
+<!-- ===== CLOUD SYNC (Supabase) ===== -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script>
+  /* =======================================================================
+     PARAGON CLOUD CONFIG  —  paste your two Supabase values between the quotes.
+     Until you do, the app simply runs offline-only (no harm). Once filled in,
+     a "Cloud Sync" panel appears in the Hero tab.
+     ======================================================================= */
+  window.SUPABASE_URL = "YOUR_SUPABASE_URL";   /* e.g.  https://abcdwxyz.supabase.co            */
+  window.SUPABASE_KEY = "YOUR_SUPABASE_KEY";   /* Publishable key (sb_publishable_...) or anon key */
+</script>
 <style>
 /* ============================================================
    PARAGON — COMIC BOOK HERO SYSTEM
@@ -692,8 +703,8 @@ function loadState(){
     });
   }catch(e){ console.warn("load failed",e); return defaultState(); }
 }
-const save = debounce(()=>{ try{ localStorage.setItem(LS_KEY, JSON.stringify(S)); }catch(e){ toast("Storage full — export a backup","⚠️"); } }, 250);
-function saveNow(){ try{ localStorage.setItem(LS_KEY, JSON.stringify(S)); }catch(e){} }
+const save = debounce(()=>{ try{ localStorage.setItem(LS_KEY, JSON.stringify(S)); }catch(e){ toast("Storage full — export a backup","⚠️"); } if(window.__cloudPush)window.__cloudPush(); }, 250);
+function saveNow(){ try{ localStorage.setItem(LS_KEY, JSON.stringify(S)); }catch(e){} if(window.__cloudPush)window.__cloudPush(); }
 
 /* ----------------------------- DERIVED STATS ----------------------------- */
 function liftSessions(d=S){ return d.sessions.filter(s=>s.group!=="Cardio"); }
@@ -2535,6 +2546,177 @@ function trainCards(){
 /* ===================== BOOT (run after overrides) ===================== */
 if(document.readyState==="loading") document.addEventListener("DOMContentLoaded", boot);
 else boot();
+</script>
+<script>
+/* ========================================================================
+   PARAGON — Cloud Sync module (Supabase)
+   Self-contained. Reads window.SUPABASE_URL / window.SUPABASE_KEY.
+   If unconfigured (or library/network unavailable) the app stays offline-only.
+   ======================================================================== */
+(function(){
+  "use strict";
+  var URL_ = (window.SUPABASE_URL||"").trim();
+  var KEY_ = (window.SUPABASE_KEY||"").trim();
+  var CONFIGURED = !!(URL_ && KEY_ && URL_.indexOf("YOUR_")!==0 && KEY_.indexOf("YOUR_")!==0 && /^https?:\/\//.test(URL_));
+
+  window.CLOUD = { configured:CONFIGURED, user:null, status:"off", sb:null };
+  window.__cloudPush = function(){};            // no-op until logged in
+
+  if(!CONFIGURED) return;                        // offline-only mode
+  if(typeof supabase==="undefined" || !supabase.createClient){ window.CLOUD.status="offline"; return; }
+
+  var sb = supabase.createClient(URL_, KEY_, { auth:{ persistSession:true, autoRefreshToken:true } });
+  window.CLOUD.sb = sb;
+  var LS_KEY = "paragon_v1";
+
+  /* ---------- helpers ---------- */
+  function setStatus(s){ window.CLOUD.status=s; paintAcct(); }
+  function writeLocal(){ try{ localStorage.setItem(LS_KEY, JSON.stringify(S)); }catch(e){} }
+  function rerender(){ try{ if(typeof renderView==="function") renderView(); if(typeof updateStreakChip==="function") updateStreakChip(); }catch(e){} }
+  function replaceState(obj){ for(var k in S){ if(Object.prototype.hasOwnProperty.call(S,k)) delete S[k]; } Object.assign(S, obj); }
+
+  /* ---------- push (debounced) ---------- */
+  var pushT=null;
+  window.__cloudPush = function(){ if(!window.CLOUD.user) return; clearTimeout(pushT); pushT=setTimeout(doPush, 1500); };
+  function doPush(){
+    if(!window.CLOUD.user) return;
+    setStatus("syncing");
+    sb.from("user_state").upsert({ id:window.CLOUD.user.id, data:S, updated_at:new Date().toISOString() })
+      .then(function(res){ setStatus(res && res.error ? "error" : "synced"); })
+      .catch(function(){ setStatus("error"); });
+  }
+
+  /* ---------- pull / seed on sign-in ---------- */
+  function pull(){
+    if(!window.CLOUD.user) return;
+    setStatus("syncing");
+    sb.from("user_state").select("data").eq("id", window.CLOUD.user.id).maybeSingle()
+      .then(function(res){
+        if(res && res.error){ setStatus("error"); return; }
+        var cloud = res && res.data ? res.data.data : null;
+        var hasCloud = cloud && typeof cloud==="object" && ((cloud.sessions && cloud.sessions.length) || (cloud.xp!=null && cloud.xp>0) || (cloud.totals && cloud.totals.workouts>0));
+        if(hasCloud){
+          try{
+            var merged = Object.assign((typeof defaultState==="function"?defaultState():{}), cloud);
+            for(var k in S){ if(merged[k]===undefined) merged[k]=S[k]; }
+            replaceState(merged);
+          }catch(e){}
+          writeLocal(); setStatus("synced"); rerender();
+          if(typeof toast==="function") toast("Synced from your account","☁️","success");
+        } else {
+          doPush();
+          if(typeof toast==="function") toast("Account ready — your data is backed up","☁️","success");
+        }
+      })
+      .catch(function(){ setStatus("error"); });
+  }
+
+  /* ---------- auth ---------- */
+  function signIn(email,pw){ return sb.auth.signInWithPassword({ email:email, password:pw }); }
+  function signUp(email,pw){ return sb.auth.signUp({ email:email, password:pw }); }
+  function signOut(){ return sb.auth.signOut(); }
+
+  sb.auth.getSession().then(function(res){
+    var session = res && res.data ? res.data.session : null;
+    window.CLOUD.user = session ? session.user : null;
+    if(window.CLOUD.user) pull(); else setStatus("off");
+    paintAcct();
+  }).catch(function(){ setStatus("error"); });
+
+  sb.auth.onAuthStateChange(function(event, session){
+    if(event==="INITIAL_SESSION") return;        // handled by getSession
+    window.CLOUD.user = session ? session.user : null;
+    if(event==="SIGNED_IN") pull();
+    else if(event==="SIGNED_OUT") setStatus("off");
+    paintAcct(); rerenderHeroIfOpen();
+  });
+
+  /* ---------- account panel (prepended into the Hero view) ---------- */
+  function acctHTML(){
+    var c = window.CLOUD;
+    if(!c.configured) return "";
+    if(c.user){
+      var st = c.status==="syncing" ? "Syncing…" : (c.status==="error" ? "Sync error — will retry" : "Synced \u2713");
+      return '<div class="panel" id="acctPanel"><span class="cap">Account</span>'
+        + '<div class="setting-row" style="margin-top:12px"><div class="sr-body"><b>'+esc(c.user.email||"Signed in")+'</b><span>'+st+'</span></div>'
+        + '<button class="btn sm" data-auth="syncnow">Sync now</button></div>'
+        + '<div class="setting-row" style="border-bottom:none"><div class="sr-body"><b>Sign out</b><span>Your data stays safe in your account</span></div>'
+        + '<button class="btn sm ghost" data-auth="signout">Sign out</button></div></div>';
+    }
+    return '<div class="panel" id="acctPanel"><span class="cap">Cloud Sync</span>'
+      + '<p style="margin:12px 0 14px;font-weight:700;opacity:.82;line-height:1.45">Sign in to back up your progress and sync it across every device you use.</p>'
+      + '<div style="display:flex;gap:10px;flex-wrap:wrap"><button class="btn primary" data-auth="signup">Create account</button>'
+      + '<button class="btn" data-auth="signin">Sign in</button></div></div>';
+  }
+  function paintAcct(){ var el=document.getElementById("acctPanel"); if(el) el.outerHTML = acctHTML(); }
+  function rerenderHeroIfOpen(){ try{ if(typeof CURRENT!=="undefined" && CURRENT==="hero" && typeof renderView==="function") renderView(); }catch(e){} }
+
+  // wrap the (comic) viewHero to prepend the account panel
+  if(typeof viewHero==="function"){
+    var _viewHero = viewHero;
+    viewHero = function(){ return acctHTML() + _viewHero(); };
+  }
+
+  /* ---------- auth modal ---------- */
+  function openAuth(mode){
+    var scrim = document.getElementById("authScrim");
+    if(!scrim){ scrim = document.createElement("div"); scrim.id="authScrim"; scrim.className="modal-scrim"; document.body.appendChild(scrim); }
+    var isSignup = mode==="signup";
+    scrim.innerHTML = '<div class="modal">'
+      + '<h3>'+(isSignup?"Create Account":"Sign In")+'</h3>'
+      + '<p class="m-desc">'+(isSignup?"Make an account to sync your training across devices.":"Welcome back, hero.")+'</p>'
+      + '<div class="field" style="margin-top:14px"><label>Email</label><input class="input" id="authEmail" type="email" autocomplete="email" placeholder="you@example.com"></div>'
+      + '<div class="field" style="margin-top:10px"><label>Password</label><input class="input" id="authPass" type="password" autocomplete="'+(isSignup?"new-password":"current-password")+'" placeholder="At least 6 characters"></div>'
+      + '<div id="authErr" style="color:var(--red);font-weight:800;font-size:.82rem;margin-top:10px;display:none"></div>'
+      + '<div class="modal-actions"><button class="btn ghost" data-authx="cancel">Cancel</button><button class="btn primary" data-authx="submit">'+(isSignup?"Create Account":"Sign In")+'</button></div>'
+      + '<div style="text-align:center;margin-top:12px;font-size:.82rem;font-weight:700;opacity:.8">'+(isSignup?"Already have an account? ":"New here? ")+'<a href="#" data-authx="switch" style="color:var(--accent);font-weight:800">'+(isSignup?"Sign in":"Create one")+'</a></div>'
+      + '</div>';
+    scrim.classList.add("show"); scrim.__mode = mode;
+    var em=document.getElementById("authEmail"); if(em) setTimeout(function(){ try{em.focus();}catch(e){} },60);
+  }
+  function closeAuth(){ var s=document.getElementById("authScrim"); if(s) s.classList.remove("show"); }
+  function authError(msg){ var e=document.getElementById("authErr"); if(e){ e.textContent=msg; e.style.display="block"; } }
+  function authSubmit(){
+    var scrim=document.getElementById("authScrim"); if(!scrim) return;
+    var mode = scrim.__mode || "signin";
+    var email=((document.getElementById("authEmail")||{}).value||"").trim();
+    var pw=(document.getElementById("authPass")||{}).value||"";
+    if(!email || !pw){ authError("Enter your email and password."); return; }
+    if(pw.length<6){ authError("Password must be at least 6 characters."); return; }
+    var btn = scrim.querySelector('[data-authx="submit"]'); var label = mode==="signup"?"Create Account":"Sign In";
+    if(btn){ btn.textContent="\u2026"; btn.disabled=true; }
+    var p = (mode==="signup") ? signUp(email,pw) : signIn(email,pw);
+    p.then(function(res){
+      if(res && res.error){ authError(res.error.message||"Something went wrong."); if(btn){btn.textContent=label;btn.disabled=false;} return; }
+      if(mode==="signup" && res && res.data && !res.data.session){
+        authError("Check your email to confirm your account, then sign in."); if(btn){btn.textContent=label;btn.disabled=false;} return;
+      }
+      closeAuth();
+      if(typeof toast==="function") toast(mode==="signup"?"Account created — you're synced!":"Signed in","\u2713","success");
+    }).catch(function(){ authError("Network error — please try again."); if(btn){btn.textContent=label;btn.disabled=false;} });
+  }
+
+  /* ---------- event wiring (delegated) ---------- */
+  document.addEventListener("click", function(e){
+    var b = e.target.closest ? e.target.closest("[data-auth]") : null;
+    if(b){ var a=b.getAttribute("data-auth");
+      if(a==="signup") openAuth("signup");
+      else if(a==="signin") openAuth("signin");
+      else if(a==="signout") signOut();
+      else if(a==="syncnow") doPush();
+      return;
+    }
+    var x = e.target.closest ? e.target.closest("[data-authx]") : null;
+    if(x){ e.preventDefault(); var ax=x.getAttribute("data-authx");
+      if(ax==="cancel") closeAuth();
+      else if(ax==="submit") authSubmit();
+      else if(ax==="switch"){ var s=document.getElementById("authScrim"); openAuth(s && s.__mode==="signup" ? "signin" : "signup"); }
+    }
+  });
+  document.addEventListener("keydown", function(e){
+    if(e.key==="Enter"){ var s=document.getElementById("authScrim"); if(s && s.classList.contains("show")){ e.preventDefault(); authSubmit(); } }
+  });
+})();
 </script>
 </body>
 </html>
